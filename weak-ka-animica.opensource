@@ -1,0 +1,902 @@
+--!strict
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+local GuiService = game:GetService("GuiService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+-- Remote References
+local Systems = ReplicatedStorage:WaitForChild("Systems", 5) :: Instance?
+local ActionsSystem = (Systems and Systems:WaitForChild("ActionsSystem", 5)) :: Instance?
+local Network = (ActionsSystem and ActionsSystem:WaitForChild("Network", 5)) :: Instance?
+local Remote = (Network and Network:WaitForChild("Attack", 5)) :: Instance?
+
+-- Dynamic Remote Resolver for Item/Consumable Actions
+local UseRemote = Network and (
+    Network:FindFirstChild("UseItem") or 
+    Network:FindFirstChild("Consume") or 
+    Network:FindFirstChild("Eat") or 
+    Network:FindFirstChild("Use") or 
+    Network:FindFirstChild("InventoryAction")
+) :: Instance?
+
+local EntitiesFolder = workspace:FindFirstChild("Entities") :: Instance?
+
+-- CONFIGURATION
+local TargetSpeed: number = 50 
+local FlySpeed: number = 50
+local BURST_COUNT: number = 3 
+local ATTACK_RANGE: number = 45
+
+local auraEnabled: boolean = false
+local speedEnabled: boolean = false
+local flyEnabled: boolean = false
+local autoEatEnabled: boolean = false
+local espEnabled: boolean = false
+local infJumpEnabled: boolean = false
+local attackIndex: number = 1
+local lastEatTick: number = 0
+local lastAuraTick: number = 0
+
+-- Joystick State Vectors
+local joystickVector: Vector3 = Vector3.new()
+local isJoystickDragging: boolean = false
+
+local espObjects: { [Model]: Highlight } = {}
+
+-- Validation Utilities
+local function valid(c: Instance?): boolean
+    if not c then return false end
+    local hum = c:FindFirstChildOfClass("Humanoid") :: Humanoid?
+    local hrp = c:FindFirstChild("HumanoidRootPart") :: BasePart?
+    return (hum and hrp and hum.Health > 0) and true or false
+end
+
+-- Raycast obstruction check for safety
+local function isVisible(targetPart: BasePart, origin: Vector3): boolean
+    local character = LocalPlayer.Character
+    if not character then return false end
+    
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+    raycastParams.FilterDescendantsInstances = {character, targetPart.Parent}
+    
+    local result = workspace:Raycast(origin, targetPart.Position - origin, raycastParams)
+    return result == nil
+end
+
+-- Target Filter
+local function getTargets(): {Model}
+    local my = LocalPlayer.Character
+    if not valid(my) or not my then return {} end
+    
+    local myHrp = my:FindFirstChild("HumanoidRootPart") :: BasePart?
+    if not myHrp then return {} end
+    local pos = myHrp.Position
+    local targets: {Model} = {}
+    
+    local function evaluateEntity(e: Instance)
+        if valid(e) and e:IsA("Model") then
+            local hrp = e:FindFirstChild("HumanoidRootPart") :: BasePart?
+            if hrp and (hrp.Position - pos).Magnitude <= ATTACK_RANGE then
+                if isVisible(hrp, pos) then
+                    table.insert(targets, e)
+                end
+            end
+        end
+    end
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            evaluateEntity(p.Character)
+        end
+    end
+    
+    if EntitiesFolder then
+        for _, e in ipairs(EntitiesFolder:GetChildren()) do
+            evaluateEntity(e)
+        end
+    end
+    return targets
+end
+
+-- Optimized Aura Burst
+local function heavyHit(t: Model)
+    if not Remote then return end
+    local hrp = t:FindFirstChild("HumanoidRootPart") :: BasePart?
+    if not hrp then return end
+    
+    for i = 1, BURST_COUNT do
+        task.spawn(function()
+            pcall(function()
+                if Remote:IsA("RemoteEvent") then
+                    Remote:FireServer(t, attackIndex)
+                    Remote:FireServer(t, attackIndex, hrp.Position)
+                elseif Remote:IsA("RemoteFunction") then
+                    (Remote :: RemoteFunction):InvokeServer(t, attackIndex)
+                end
+            end)
+        end)
+    end
+    attackIndex = (attackIndex == 1) and 2 or 1
+end
+
+-- Scans internal player folders/attributes for food name signatures
+local function findUsableFoodName(): string?
+    local backpack = LocalPlayer:FindFirstChild("Backpack") :: Instance?
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            local name = item.Name:lower()
+            if name:find("apple") or name:find("stew") or name:find("bread") 
+            or name:find("cooked") or name:find("meat") or name:find("steak") 
+            or name:find("berry") or name:find("potion") or name:find("soup") then
+                return item.Name
+            end
+        end
+    end
+
+    local invData = (LocalPlayer:FindFirstChild("Data") or LocalPlayer:FindFirstChild("Inventory") or LocalPlayer:FindFirstChild("Hotbar")) :: Instance?
+    if invData then
+        for _, item in ipairs(invData:GetChildren()) do
+            local name = item.Name:lower()
+            if name:find("apple") or name:find("stew") or name:find("bread") 
+            or name:find("cooked") or name:find("meat") or name:find("steak") 
+            or name:find("berry") or name:find("potion") or name:find("soup") then
+                return item.Name
+            end
+        end
+    end
+    return nil
+end
+
+-- ==========================================
+-- EVENT-DRIVEN ESP ENGINE
+-- ==========================================
+local function createESP(char: Model)
+    if not espEnabled or espObjects[char] then return end
+    
+    local box = Instance.new("Highlight")
+    box.Name = "SystemHighlight"
+    box.Adornee = char
+    box.FillColor = Color3.fromRGB(255, 60, 60)
+    box.FillTransparency = 0.6
+    box.OutlineColor = Color3.fromRGB(255, 255, 255)
+    box.OutlineTransparency = 0.1
+    box.Parent = char
+
+    espObjects[char] = box
+    
+    local ancestryConn: RBXScriptConnection?
+    ancestryConn = char.AncestryChanged:Connect(function()
+        if not char:IsDescendantOf(workspace) then
+            if espObjects[char] then
+                espObjects[char]:Destroy()
+                espObjects[char] = nil
+            end
+            if ancestryConn then
+                ancestryConn:Disconnect()
+            end
+        end
+    end)
+end
+
+local function removeESP(char: Model)
+    if espObjects[char] then
+        pcall(function() espObjects[char]:Destroy() end)
+        espObjects[char] = nil
+    end
+end
+
+local function cleanAllESP()
+    for char, _ in pairs(espObjects) do
+        removeESP(char)
+    end
+end
+
+local function updateESPState()
+    if not espEnabled then
+        cleanAllESP()
+        return
+    end
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character and valid(p.Character) then
+            createESP(p.Character)
+        end
+    end
+    if EntitiesFolder then
+        for _, e in ipairs(EntitiesFolder:GetChildren()) do
+            if valid(e) and e:IsA("Model") then createESP(e) end
+        end
+    end
+end
+
+Players.PlayerAdded:Connect(function(p)
+    p.CharacterAdded:Connect(function(char)
+        task.wait(0.5)
+        if espEnabled and valid(char) then createESP(char) end
+    end)
+end)
+
+if EntitiesFolder then
+    EntitiesFolder.ChildAdded:Connect(function(child)
+        task.wait(0.1)
+        if espEnabled and valid(child) and child:IsA("Model") then createESP(child) end
+    end)
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1.5)
+        if espEnabled then updateESPState() end
+    end
+end)
+
+-- Parent Environment Handling
+local targetGui: Instance;
+local success, err = pcall(function() targetGui = CoreGui end)
+if not success or not targetGui then
+    targetGui = LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- ScreenGui Setup
+local sg = Instance.new("ScreenGui")
+sg.Name = "VoxelGodHub"
+sg.ResetOnSpawn = false
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+-- ==========================================
+-- MENU 1: MAIN FUNCTIONAL TOGGLES (LEFT SIDE)
+-- ==========================================
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 260, 0, 390) 
+MainFrame.Position = UDim2.new(0.05, 0, 0.25, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Parent = sg
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 8)
+MainCorner.Parent = MainFrame
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 35)
+Title.BackgroundTransparency = 1
+Title.Font = Enum.Font.GothamBold
+Title.Text = "VOXEL GOD"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.TextSize = 14
+Title.Parent = MainFrame
+
+local StatusText = Instance.new("TextLabel")
+StatusText.Size = UDim2.new(1, 0, 0, 15)
+StatusText.Position = UDim2.new(0, 0, 0, 30)
+StatusText.BackgroundTransparency = 1
+StatusText.Font = Enum.Font.GothamSemibold
+StatusText.Text = "SYSTEMS IDLE"
+StatusText.TextColor3 = Color3.fromRGB(220, 70, 70)
+StatusText.TextSize = 10
+StatusText.Parent = MainFrame
+
+-- Scrolling Dynamic Container for Buttons
+local Container = Instance.new("ScrollingFrame")
+Container.Size = UDim2.new(0.9, 0, 0.78, 0)
+Container.Position = UDim2.new(0.05, 0, 0, 55)
+Container.BackgroundTransparency = 1
+Container.BorderSizePixel = 0
+Container.ScrollBarThickness = 2
+Container.CanvasSize = UDim2.new(0, 0, 0, 0)
+Container.Parent = MainFrame
+
+local UIList = Instance.new("UIListLayout")
+UIList.Padding = UDim.new(0, 6)
+UIList.SortOrder = Enum.SortOrder.LayoutOrder
+UIList.HorizontalAlignment = Enum.HorizontalAlignment.Center
+UIList.Parent = Container
+
+local UIPadding = Instance.new("UIPadding")
+UIPadding.PaddingTop = UDim.new(0, 2)
+UIPadding.Parent = Container
+
+UIList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    Container.CanvasSize = UDim2.new(0, 0, 0, UIList.AbsoluteContentSize.Y + 10)
+end)
+
+local function createButton(text: string, order: number): TextButton
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.98, 0, 0, 32)
+    btn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamBold
+    btn.Text = text
+    btn.TextColor3 = Color3.fromRGB(230, 230, 230)
+    btn.TextSize = 11
+    btn.LayoutOrder = order
+    btn.Parent = Container
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = btn
+    return btn
+end
+
+local ToggleBtn = createButton("Enable GOD Kill Aura", 1)
+local SpeedBtn = createButton("Enable WalkSpeed", 2)
+
+-- Slider Framework Configuration (Walkspeed)
+local SliderFrame = Instance.new("Frame")
+SliderFrame.Size = UDim2.new(0.98, 0, 0, 24)
+SliderFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+SliderFrame.LayoutOrder = 3
+SliderFrame.Parent = Container
+
+local SliderCorner = Instance.new("UICorner")
+SliderCorner.CornerRadius = UDim.new(0, 6)
+SliderCorner.Parent = SliderFrame
+
+local SliderBar = Instance.new("Frame")
+SliderBar.Size = UDim2.new(0.3, 0, 1, 0)
+SliderBar.BackgroundColor3 = Color3.fromRGB(0, 140, 255)
+SliderBar.BorderSizePixel = 0
+SliderBar.Parent = SliderFrame
+
+local SliderBarCorner = Instance.new("UICorner")
+SliderBarCorner.CornerRadius = UDim.new(0, 6)
+SliderBarCorner.Parent = SliderBar
+
+local SliderText = Instance.new("TextLabel")
+SliderText.Size = UDim2.new(1, 0, 1, 0)
+SliderText.BackgroundTransparency = 1
+SliderText.Font = Enum.Font.GothamBold
+SliderText.Text = "Speed Value: 50"
+SliderText.TextColor3 = Color3.fromRGB(255, 255, 255)
+SliderText.TextSize = 10
+SliderText.Parent = SliderFrame
+
+local FlyBtn = createButton("Enable Flight Mode", 4)
+
+-- Slider Framework Configuration (Fly Speed)
+local FlySliderFrame = Instance.new("Frame")
+FlySliderFrame.Size = UDim2.new(0.98, 0, 0, 24)
+FlySliderFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+FlySliderFrame.LayoutOrder = 5
+FlySliderFrame.Parent = Container
+
+local FlySliderCorner = Instance.new("UICorner")
+FlySliderCorner.CornerRadius = UDim.new(0, 6)
+FlySliderCorner.Parent = FlySliderFrame
+
+local FlySliderBar = Instance.new("Frame")
+FlySliderBar.Size = UDim2.new(0.3, 0, 1, 0)
+FlySliderBar.BackgroundColor3 = Color3.fromRGB(0, 200, 255)
+FlySliderBar.BorderSizePixel = 0
+FlySliderBar.Parent = FlySliderFrame
+
+local FlySliderBarCorner = Instance.new("UICorner")
+FlySliderBarCorner.CornerRadius = UDim.new(0, 6)
+FlySliderBarCorner.Parent = FlySliderBar
+
+local FlySliderText = Instance.new("TextLabel")
+FlySliderText.Size = UDim2.new(1, 0, 1, 0)
+FlySliderText.BackgroundTransparency = 1
+FlySliderText.Font = Enum.Font.GothamBold
+FlySliderText.Text = "Fly Speed: 50"
+FlySliderText.TextColor3 = Color3.fromRGB(255, 255, 255)
+FlySliderText.TextSize = 10
+FlySliderText.Parent = FlySliderFrame
+
+local EatBtn = createButton("Enable Auto-Eat", 6)
+local EspBtn = createButton("Enable Wallhack ESP", 7)
+local JumpBtn = createButton("Enable Inf Jump", 8)
+
+-- ==========================================
+-- MENU 2: LIVE RELEASES UPDATES MENU (BOTTOM RIGHT CORNER)
+-- ==========================================
+local UpdateMenuFrame = Instance.new("Frame")
+UpdateMenuFrame.Size = UDim2.new(0, 320, 0, 220) 
+UpdateMenuFrame.Position = UDim2.new(1, -340, 1, -250) 
+UpdateMenuFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+UpdateMenuFrame.BorderSizePixel = 0
+UpdateMenuFrame.Active = true
+UpdateMenuFrame.Parent = sg
+
+local UpdateMenuCorner = Instance.new("UICorner")
+UpdateMenuCorner.CornerRadius = UDim.new(0, 8)
+UpdateMenuCorner.Parent = UpdateMenuFrame
+
+local UpdateTitle = Instance.new("TextLabel")
+UpdateTitle.Size = UDim2.new(1, 0, 0, 35)
+UpdateTitle.BackgroundTransparency = 1
+UpdateTitle.Font = Enum.Font.GothamBold
+UpdateTitle.Text = "VOXEL GOD - LIVE RELEASES"
+UpdateTitle.TextColor3 = Color3.fromRGB(0, 150, 255)
+UpdateTitle.TextSize = 13
+UpdateTitle.Parent = UpdateMenuFrame
+
+local UpdatesBox = Instance.new("Frame")
+UpdatesBox.Size = UDim2.new(0.92, 0, 0.55, 0)
+UpdatesBox.Position = UDim2.new(0.04, 0, 0, 40)
+UpdatesBox.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+UpdatesBox.BorderSizePixel = 0
+UpdatesBox.Parent = UpdateMenuFrame
+
+local UpdatesBoxCorner = Instance.new("UICorner")
+UpdatesBoxCorner.CornerRadius = UDim.new(0, 6)
+UpdatesBoxCorner.Parent = UpdatesBox
+
+local UpdatesText = Instance.new("TextLabel")
+UpdatesText.Size = UDim2.new(0.94, 0, 0.9, 0)
+UpdatesText.Position = UDim2.new(0.03, 0, 0.05, 0)
+UpdatesText.BackgroundTransparency = 1
+UpdatesText.Font = Enum.Font.Gotham
+UpdatesText.Text = "📌 VERSION RELEASE 2.5:\n• Integrated Dedicated Vector Fly Module\n• Added On-Screen Dynamic Virtual Joystick Interface\n• Separated WalkSpeed and Fly Speed Slider Arrays\n• Preserved Smooth Cross-Platform Touch Processing Pipelines"
+UpdatesText.TextColor3 = Color3.fromRGB(160, 160, 160)
+UpdatesText.TextSize = 10
+UpdatesText.TextWrapped = true
+UpdatesText.TextXAlignment = Enum.TextXAlignment.Left
+UpdatesText.TextYAlignment = Enum.TextYAlignment.Top
+UpdatesText.Parent = UpdatesBox
+
+local SubBtn = Instance.new("TextButton")
+SubBtn.Size = UDim2.new(0.92, 0, 0, 35)
+SubBtn.Position = UDim2.new(0.04, 0, 0.78, 0)
+SubBtn.BackgroundColor3 = Color3.fromRGB(230, 30, 30)
+SubBtn.BorderSizePixel = 0
+SubBtn.Font = Enum.Font.GothamBold
+SubBtn.Text = "SUBSCRIBE TO @ANIMICA"
+SubBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+SubBtn.TextSize = 11
+SubBtn.Parent = UpdateMenuFrame
+
+local SubCorner = Instance.new("UICorner")
+SubCorner.CornerRadius = UDim.new(0, 6)
+SubCorner.Parent = SubBtn
+
+SubBtn.MouseButton1Click:Connect(function()
+    pcall(function()
+        GuiService:OpenBrowserWindow("https://youtube.com/@animica?si=mG5qwmhWRnNT7KGH")
+    end)
+end)
+
+-- Live Releases Minimize / Re-open Overlays
+local MinimizeUpdatesBtn = Instance.new("TextButton")
+MinimizeUpdatesBtn.Size = UDim2.new(0, 25, 0, 25)
+MinimizeUpdatesBtn.Position = UDim2.new(1, -30, 0, 5)
+MinimizeUpdatesBtn.BackgroundTransparency = 1
+MinimizeUpdatesBtn.Font = Enum.Font.GothamBold
+MinimizeUpdatesBtn.Text = "–"
+MinimizeUpdatesBtn.TextColor3 = Color3.fromRGB(150, 150, 150)
+MinimizeUpdatesBtn.TextSize = 16
+MinimizeUpdatesBtn.Parent = UpdateMenuFrame
+
+local OpenUpdatesBtn = Instance.new("TextButton")
+OpenUpdatesBtn.Size = UDim2.new(0, 110, 0, 30)
+OpenUpdatesBtn.Position = UDim2.new(1, -130, 1, -50)
+OpenUpdatesBtn.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+OpenUpdatesBtn.BorderSizePixel = 0
+OpenUpdatesBtn.Font = Enum.Font.GothamBold
+OpenUpdatesBtn.Text = "📜 RELEASES"
+OpenUpdatesBtn.TextColor3 = Color3.fromRGB(0, 150, 255)
+OpenUpdatesBtn.TextSize = 10
+OpenUpdatesBtn.Visible = false
+OpenUpdatesBtn.Active = true
+OpenUpdatesBtn.Parent = sg
+
+local OpenUpdatesCorner = Instance.new("UICorner")
+OpenUpdatesCorner.CornerRadius = UDim.new(0, 6)
+OpenUpdatesCorner.Parent = OpenUpdatesBtn
+
+MinimizeUpdatesBtn.MouseButton1Click:Connect(function()
+    UpdateMenuFrame.Visible = false
+    OpenUpdatesBtn.Visible = true
+end)
+
+OpenUpdatesBtn.MouseButton1Click:Connect(function()
+    UpdateMenuFrame.Visible = true
+    OpenUpdatesBtn.Visible = false
+end)
+
+-- ==========================================
+-- DYNAMIC VIRTUAL JOYSTICK (POPS UP ON FLY)
+-- ==========================================
+local JoystickBase = Instance.new("Frame")
+JoystickBase.Size = UDim2.new(0, 110, 0, 110)
+JoystickBase.Position = UDim2.new(0.05, 0, 0.75, -50)
+JoystickBase.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+JoystickBase.BackgroundTransparency = 0.4
+JoystickBase.BorderSizePixel = 0
+JoystickBase.Visible = false
+JoystickBase.Active = true
+JoystickBase.Parent = sg
+
+local JoystickBaseCorner = Instance.new("UICorner")
+JoystickBaseCorner.CornerRadius = UDim.new(1, 0)
+JoystickBaseCorner.Parent = JoystickBase
+
+local JoystickStick = Instance.new("TextButton")
+JoystickStick.Size = UDim2.new(0, 45, 0, 45)
+JoystickStick.Position = UDim2.new(0.5, -22, 0.5, -22)
+JoystickStick.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+JoystickStick.BackgroundTransparency = 0.2
+JoystickStick.BorderSizePixel = 0
+JoystickStick.Text = ""
+JoystickStick.Parent = JoystickBase
+
+local JoystickStickCorner = Instance.new("UICorner")
+JoystickStickCorner.CornerRadius = UDim.new(1, 0)
+JoystickStickCorner.Parent = JoystickStick
+
+-- Joystick Logic
+local function updateJoystick(input: InputObject)
+    local center = JoystickBase.AbsolutePosition + (JoystickBase.AbsoluteSize / 2)
+    local inputPos = Vector2.new(input.Position.X, input.Position.Y)
+    local direction = inputPos - center
+    local radius = JoystickBase.AbsoluteSize.X / 2
+    
+    if direction.Magnitude > radius then
+        direction = direction.Unit * radius
+    end
+    
+    JoystickStick.Position = UDim2.new(0.5, direction.X - 22, 0.5, direction.Y - 22)
+    joystickVector = Vector3.new(direction.X / radius, 0, direction.Y / radius)
+end
+
+JoystickStick.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        isJoystickDragging = true
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if isJoystickDragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        updateJoystick(input)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        isJoystickDragging = false
+        JoystickStick.Position = UDim2.new(0.5, -22, 0.5, -22)
+        joystickVector = Vector3.new()
+    end
+end)
+
+-- ==========================================
+-- MAIN INTERFACE TOGGLE FRAMEWORK
+-- ==========================================
+local MinimizeBtn = Instance.new("TextButton")
+MinimizeBtn.Size = UDim2.new(0, 25, 0, 25)
+MinimizeBtn.Position = UDim2.new(1, -30, 0, 5)
+MinimizeBtn.BackgroundTransparency = 1
+MinimizeBtn.Font = Enum.Font.GothamBold
+MinimizeBtn.Text = "×"
+MinimizeBtn.TextColor3 = Color3.fromRGB(150, 150, 150)
+MinimizeBtn.TextSize = 18
+MinimizeBtn.Parent = MainFrame
+
+local OpenBtn = Instance.new("TextButton")
+OpenBtn.Size = UDim2.new(0, 50, 0, 50)
+OpenBtn.Position = UDim2.new(0.02, 0, 0.2, 0)
+OpenBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+OpenBtn.BorderSizePixel = 0
+OpenBtn.Font = Enum.Font.GothamBold
+OpenBtn.Text = "VOXEL"
+OpenBtn.TextColor3 = Color3.fromRGB(0, 150, 255)
+OpenBtn.TextSize = 9
+OpenBtn.Visible = false
+OpenBtn.Active = true
+OpenBtn.Parent = sg
+
+local OpenCorner = Instance.new("UICorner")
+OpenCorner.CornerRadius = UDim.new(1, 0)
+OpenCorner.Parent = OpenBtn
+
+MinimizeBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = false
+    UpdateMenuFrame.Visible = false
+    OpenUpdatesBtn.Visible = false
+    JoystickBase.Visible = false
+    OpenBtn.Visible = true
+end)
+
+OpenBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = true
+    OpenBtn.Visible = false
+    -- Restore previous state of the updates panel upon maximizing
+    if not OpenUpdatesBtn.Visible then
+        UpdateMenuFrame.Visible = true
+    end
+    if flyEnabled then JoystickBase.Visible = true end
+end)
+
+-- Dragging Interface Logic
+local function makeDraggable(frame: GuiObject)
+    local dragging: boolean = false
+    local dragInput: InputObject? = nil
+    local dragStart: Vector3 = Vector3.new()
+    local startPos: UDim2 = UDim2.new()
+    
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+            
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    frame.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+end
+
+makeDraggable(MainFrame)
+makeDraggable(UpdateMenuFrame)
+makeDraggable(OpenBtn)
+makeDraggable(OpenUpdatesBtn)
+
+-- Slider Framework Handlers
+local minSpeed, maxSpeed = 16, 150
+
+-- Walkspeed Slider Logic
+local isSliding = false
+local function updateSlider(input: InputObject)
+    local xOffset = math.clamp(input.Position.X - SliderFrame.AbsolutePosition.X, 0, SliderFrame.AbsoluteSize.X)
+    local percentage = xOffset / SliderFrame.AbsoluteSize.X
+    SliderBar.Size = UDim2.new(percentage, 0, 1, 0)
+    TargetSpeed = math.round(minSpeed + (percentage * (maxSpeed - minSpeed)))
+    SliderText.Text = "Speed Value: " .. tostring(TargetSpeed)
+end
+
+SliderFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        isSliding = true
+        updateSlider(input)
+    end
+end)
+
+-- Fly Speed Slider Logic
+local isSlidingFly = false
+local function updateFlySlider(input: InputObject)
+    local xOffset = math.clamp(input.Position.X - FlySliderFrame.AbsolutePosition.X, 0, FlySliderFrame.AbsoluteSize.X)
+    local percentage = xOffset / FlySliderFrame.AbsoluteSize.X
+    FlySliderBar.Size = UDim2.new(percentage, 0, 1, 0)
+    FlySpeed = math.round(minSpeed + (percentage * (maxSpeed - minSpeed)))
+    FlySliderText.Text = "Fly Speed: " .. tostring(FlySpeed)
+end
+
+FlySliderFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        isSlidingFly = true
+        updateFlySlider(input)
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        if isSliding then updateSlider(input) end
+        if isSlidingFly then updateFlySlider(input) end
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        isSliding = false
+        isSlidingFly = false
+    end
+end)
+
+local function updateStatus()
+    local parts = {}
+    if auraEnabled then table.insert(parts, "Aura") end
+    if speedEnabled then table.insert(parts, "Speed") end
+    if flyEnabled then table.insert(parts, "Fly") end
+    if autoEatEnabled then table.insert(parts, "Eat") end
+    if espEnabled then table.insert(parts, "ESP") end
+    if infJumpEnabled then table.insert(parts, "Jump") end
+    
+    if #parts > 0 then
+        StatusText.Text = "ACTIVE: " .. table.concat(parts, " | ")
+        StatusText.TextColor3 = Color3.fromRGB(0, 220, 120)
+    else
+        StatusText.Text = "SYSTEMS IDLE"
+        StatusText.TextColor3 = Color3.fromRGB(220, 70, 70)
+    end
+end
+
+-- Feature Toggles
+local function toggleAura()
+    auraEnabled = not auraEnabled
+    ToggleBtn.BackgroundColor3 = auraEnabled and Color3.fromRGB(0, 130, 70) or Color3.fromRGB(30, 30, 30)
+    ToggleBtn.Text = auraEnabled and "Disable GOD Kill Aura" or "Enable GOD Kill Aura"
+    updateStatus()
+end
+
+local function toggleSpeed()
+    speedEnabled = not speedEnabled
+    SpeedBtn.BackgroundColor3 = speedEnabled and Color3.fromRGB(0, 130, 70) or Color3.fromRGB(30, 30, 30)
+    SpeedBtn.Text = speedEnabled and "Disable WalkSpeed" or "Enable WalkSpeed"
+    if not speedEnabled and LocalPlayer.Character then
+        local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid") :: Humanoid?
+        if hum then pcall(function() hum.WalkSpeed = 16 end) end
+    end
+    updateStatus()
+end
+
+local function toggleFly()
+    flyEnabled = not flyEnabled
+    FlyBtn.BackgroundColor3 = flyEnabled and Color3.fromRGB(0, 130, 70) or Color3.fromRGB(30, 30, 30)
+    FlyBtn.Text = flyEnabled and "Disable Flight Mode" or "Enable Flight Mode"
+    JoystickBase.Visible = flyEnabled and MainFrame.Visible
+    updateStatus()
+end
+
+local function toggleEat()
+    autoEatEnabled = not autoEatEnabled
+    EatBtn.BackgroundColor3 = autoEatEnabled and Color3.fromRGB(0, 130, 70) or Color3.fromRGB(30, 30, 30)
+    EatBtn.Text = autoEatEnabled and "Disable Auto-Eat" or "Enable Auto-Eat"
+    updateStatus()
+end
+
+local function toggleESP()
+    espEnabled = not espEnabled
+    EspBtn.BackgroundColor3 = espEnabled and Color3.fromRGB(0, 130, 70) or Color3.fromRGB(30, 30, 30)
+    EspBtn.Text = espEnabled and "Disable Wallhack ESP" or "Enable Wallhack ESP"
+    updateESPState()
+    updateStatus()
+end
+
+local function toggleJump()
+    infJumpEnabled = not infJumpEnabled
+    JumpBtn.BackgroundColor3 = infJumpEnabled and Color3.fromRGB(0, 130, 70) or Color3.fromRGB(30, 30, 30)
+    JumpBtn.Text = infJumpEnabled and "Disable Inf Jump" or "Enable Inf Jump"
+    updateStatus()
+end
+
+UserInputService.JumpRequest:Connect(function()
+    if infJumpEnabled and LocalPlayer.Character then
+        local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid") :: Humanoid?
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end)
+
+-- Main Cycle Runtime Framework Loop
+RunService.Heartbeat:Connect(function(deltaTime)
+    local now = os.clock()
+
+    if LocalPlayer.Character and valid(LocalPlayer.Character) then
+        local character = LocalPlayer.Character
+        local hum = character:FindFirstChildOfClass("Humanoid") :: Humanoid?
+        local hrp = character:FindFirstChild("HumanoidRootPart") :: BasePart?
+
+        if hrp and hum then
+            -- Flight Pipeline Logic
+            if flyEnabled then
+                hum.PlatformStand = true
+                local moveDir = hum.MoveDirection
+                
+                -- Support PC WASD input fallback blended with Mobile Joystick Vectors
+                if joystickVector.Magnitude > 0 then
+                    local camLook = Camera.CFrame.LookVector
+                    local camRight = Camera.CFrame.RightVector
+                    local flatLook = Vector3.new(camLook.X, 0, camLook.Z).Unit
+                    local flatRight = Vector3.new(camRight.X, 0, camRight.Z).Unit
+                    moveDir = (flatLook * -joystickVector.Z) + (flatRight * joystickVector.X)
+                end
+                
+                -- Check manual key triggers for vertical climb/descend configurations
+                local verticalVelocity = 0
+                if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+                    verticalVelocity = 1
+                elseif UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+                    verticalVelocity = -1
+                end
+                
+                local combinedDir = (moveDir + Vector3.new(0, verticalVelocity, 0))
+                if combinedDir.Magnitude > 0 then
+                    combinedDir = combinedDir.Unit
+                end
+                
+                hrp.Velocity = combinedDir * FlySpeed
+                hrp.Anchored = false
+            else
+                if hum.PlatformStand then
+                    hum.PlatformStand = false
+                end
+                
+                -- Regular WalkSpeed Execution Loop
+                if speedEnabled and hum.WalkSpeed ~= TargetSpeed then
+                    hum.WalkSpeed = TargetSpeed
+                end
+            end
+        end
+    end
+
+    if auraEnabled and (now - lastAuraTick) > 0.12 then
+        lastAuraTick = now
+        local targets = getTargets()
+        for _, t in ipairs(targets) do
+            heavyHit(t)
+        end
+    end
+
+    -- ITEM REMOTE CONSUME FRAMEWORK
+    if autoEatEnabled and (now - lastEatTick) > 0.7 then
+        local character = LocalPlayer.Character
+        if character then
+            local humanoid = character:FindFirstChildOfClass("Humanoid") :: Humanoid?
+            if humanoid then
+                local currentHealth = humanoid.Health
+                local maxHealth = humanoid.MaxHealth
+                
+                local currentHunger: number = 100
+                local hungerAttr = LocalPlayer:GetAttribute("Hunger") or LocalPlayer:GetAttribute("Food")
+                if typeof(hungerAttr) == "number" then
+                    currentHunger = hungerAttr
+                else
+                    local dataFolder = LocalPlayer:FindFirstChild("Data") :: Instance?
+                    local hungerVal = dataFolder and dataFolder:FindFirstChild("Hunger") :: NumberValue?
+                    if hungerVal and hungerVal:IsA("ValueBase") then
+                        currentHunger = (hungerVal.Value :: any) or 100
+                    end
+                end
+
+                if currentHealth < (maxHealth * 0.6) or currentHunger < 40 then
+                    local foodName = findUsableFoodName()
+                    
+                    if foodName and UseRemote then
+                        lastEatTick = now 
+                        
+                        task.spawn(function()
+                            pcall(function()
+                                if UseRemote:IsA("RemoteEvent") then
+                                    UseRemote:FireServer(foodName)
+                                    UseRemote:FireServer(foodName, 1) 
+                                elseif UseRemote:IsA("RemoteFunction") then
+                                    (UseRemote :: RemoteFunction):InvokeServer(foodName)
+                                end
+                            end)
+                        end)
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- Structural GC Disconnections
+Players.PlayerRemoving:Connect(function(player)
+    if player.Character then removeESP(player.Character) end
+end)
+
+ToggleBtn.MouseButton1Click:Connect(toggleAura)
+SpeedBtn.MouseButton1Click:Connect(toggleSpeed)
+FlyBtn.MouseButton1Click:Connect(toggleFly)
+EatBtn.MouseButton1Click:Connect(toggleEat)
+EspBtn.MouseButton1Click:Connect(toggleESP)
+JumpBtn.MouseButton1Click:Connect(toggleJump)
+
+-- Menu Display Handler (K Key)
+UserInputService.InputBegan:Connect(function(i, gameProcessed)
+    if gameProcessed then return end
+    if i.KeyCode == Enum.KeyCode.K then
+        sg.Enabled = not sg.Enabled
+    end
+end)
+
+sg.Parent = targetGui
