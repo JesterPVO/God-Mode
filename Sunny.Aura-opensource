@@ -1,0 +1,190 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 15)
+
+local Remote = nil
+pcall(function()
+    Remote = ReplicatedStorage.Systems.ActionsSystem.Network.Attack
+end)
+
+local enabled = false
+local attackIndex = 1
+local conn = nil
+
+local whitelistRegistry = {}
+
+local function valid(c)
+    return c and c:FindFirstChild("Humanoid") and c:FindFirstChild("HumanoidRootPart") and c.Humanoid.Health > 0 
+end
+
+local function nearest()
+    local my = LocalPlayer.Character
+    if not valid(my) then return nil end
+    local pos = my.HumanoidRootPart.Position
+    local best, dist = nil, 32
+    
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character and not whitelistRegistry[tostring(p.Name)] then
+            local t = p.Character
+            if valid(t) then
+                local d = (t.HumanoidRootPart.Position - pos).Magnitude
+                if d < dist then
+                    best = t
+                    dist = d
+                end
+            end
+        end
+    end
+    
+    local entitiesFolder = workspace:FindFirstChild("Entities") or workspace:FindFirstChild("Mobs")
+    if entitiesFolder then
+        for _, e in pairs(entitiesFolder:GetChildren()) do
+            if valid(e) then
+                local d = (e.HumanoidRootPart.Position - pos).Magnitude
+                if d < dist then
+                    best = e
+                    dist = d
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+local function hit(t)
+    if not Remote then return end
+    pcall(function() Remote:InvokeServer(t, attackIndex) end)
+    attackIndex = attackIndex == 1 and 2 or 1
+end
+
+local function toggleScript()
+    enabled = not enabled
+    
+    if enabled then
+        conn = RunService.Heartbeat:Connect(function()
+            local t = nearest()
+            if t then 
+                hit(t)
+                task.wait(math.random(90, 170) / 1000)
+            end
+        end)
+    else
+        if conn then conn:Disconnect() conn = nil end
+    end
+    
+    local mainButton = PlayerGui:FindFirstChild("killaura") and PlayerGui.killaura.Frame:FindFirstChild("TextButton")
+    if mainButton then
+        mainButton.BackgroundColor3 = enabled and Color3.fromRGB(100, 200, 100) or Color3.fromRGB(200, 60, 60)
+    end
+end
+
+local oldGui = PlayerGui:FindFirstChild("killaura")
+if oldGui then oldGui:Destroy() end
+
+local sg = Instance.new("ScreenGui", PlayerGui)
+sg.Name = "killaura"
+sg.ResetOnSpawn = false
+sg.DisplayOrder = 99999
+
+local f = Instance.new("Frame")
+f.Size = UDim2.new(0, 80, 0, 80)
+f.Position = UDim2.new(0.85, 0, 0.7, 0)
+f.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+f.BorderSizePixel = 0
+f.Active = true
+f.Draggable = true
+f.Parent = sg
+
+Instance.new("UICorner", f).CornerRadius = UDim.new(0, 12)
+
+local b = Instance.new("TextButton", f)
+b.Size = UDim2.new(0.8, 0, 0.8, 0)
+b.Position = UDim2.new(0.1, 0, 0.1, 0)
+b.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+b.BorderSizePixel = 0
+b.Font = Enum.Font.GothamBold
+b.Text = "K"
+b.TextColor3 = Color3.fromRGB(255, 255, 255)
+b.TextSize = 28
+Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+
+b.Activated:Connect(toggleScript)
+
+local wlFrame = Instance.new("Frame")
+wlFrame.Size = UDim2.new(0, 150, 0, 200)
+wlFrame.Position = UDim2.new(0.85, -160, 0.7, 0)
+wlFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+wlFrame.BorderSizePixel = 0
+wlFrame.Active = true
+wlFrame.Draggable = true
+wlFrame.Parent = sg
+Instance.new("UICorner", wlFrame).CornerRadius = UDim.new(0, 8)
+
+local wlTitle = Instance.new("TextLabel", wlFrame)
+wlTitle.Size = UDim2.new(1, 0, 0, 25)
+wlTitle.BackgroundTransparency = 1
+wlTitle.Font = Enum.Font.GothamBold
+wlTitle.Text = "KA WHITELIST"
+wlTitle.TextColor3 = Color3.fromRGB(200, 200, 200)
+wlTitle.TextSize = 12
+
+local wlScroll = Instance.new("ScrollingFrame", wlFrame)
+wlScroll.Size = UDim2.new(0.9, 0, 0.8, 0)
+wlScroll.Position = UDim2.new(0.05, 0, 0.15, 0)
+wlScroll.BackgroundTransparency = 1
+wlScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+wlScroll.ScrollBarThickness = 3
+
+local wlLayout = Instance.new("UIListLayout", wlScroll)
+wlLayout.Padding = UDim.new(0, 4)
+
+task.spawn(function()
+    while true do
+        for _, item in pairs(wlScroll:GetChildren()) do
+            if item:IsA("TextButton") then item:Destroy() end
+        end
+        
+        for _, player in pairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local pNameString = tostring(player.Name)
+                
+                if whitelistRegistry[pNameString] == nil then
+                    whitelistRegistry[pNameString] = false
+                end
+                
+                local pBtn = Instance.new("TextButton", wlScroll)
+                pBtn.Size = UDim2.new(1, 0, 0, 22)
+                pBtn.BorderSizePixel = 0
+                pBtn.Font = Enum.Font.Gotham
+                pBtn.Text = pNameString
+                pBtn.TextSize = 11
+                pBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                Instance.new("UICorner", pBtn).CornerRadius = UDim.new(0, 4)
+                
+                local function refreshVisual()
+                    pBtn.BackgroundColor3 = whitelistRegistry[pNameString] and Color3.fromRGB(41, 128, 185) or Color3.fromRGB(50, 50, 50)
+                end
+                refreshVisual()
+                
+                pBtn.Activated:Connect(function()
+                    whitelistRegistry[pNameString] = not whitelistRegistry[pNameString]
+                    refreshVisual()
+                end)
+            end
+        end
+        wlScroll.CanvasSize = UDim2.new(0, 0, 0, wlLayout.AbsoluteContentSize.Y + 5)
+        task.wait(10)
+    end
+end)
+
+UserInputService.InputBegan:Connect(function(i, gameProcessed)
+    if UserInputService:GetFocusedTextBox() then return end
+    if i.KeyCode == Enum.KeyCode.K then
+        toggleScript()
+    end
+end)
