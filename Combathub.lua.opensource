@@ -1,0 +1,568 @@
+-- Combat Hub — Made by animica (Updated with ESP Boxes, Fly, Speed, Inf Jump)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Camera = workspace.CurrentCamera
+
+local LocalPlayer = Players.LocalPlayer
+local Remote = ReplicatedStorage:FindFirstChild("Systems") 
+    and ReplicatedStorage.Systems:FindFirstChild("ActionsSystem") 
+    and ReplicatedStorage.Systems.ActionsSystem:FindFirstChild("Network") 
+    and ReplicatedStorage.Systems.ActionsSystem.Network:FindFirstChild("Attack")
+
+local enabled = false
+local autoKillEnabled = false
+local espEnabled = false
+local autoCollectEnabled = false
+local infJumpEnabled = false
+local flyEnabled = false
+local speedEnabled = false
+local speedMultiplier = 16 -- default walkspeed increment or custom value
+
+-- Fly Variables
+local flying = false
+local flySpeed = 50
+local controlKeys = {W = 0, S = 0, A = 0, D = 0, Q = 0, E = 0}
+local bodyGyro, bodyVelocity
+
+local function valid(c) 
+    return c and c:FindFirstChild("Humanoid") and c:FindFirstChild("HumanoidRootPart") and c.Humanoid.Health > 0 
+end
+
+local function getAllTargets()
+    local my = LocalPlayer.Character
+    if not valid(my) then return {} end
+    local pos = my.HumanoidRootPart.Position
+    local targets = {}
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            local t = p.Character
+            if valid(t) then
+                local d = (t.HumanoidRootPart.Position - pos).Magnitude
+                if d <= 100 then
+                    table.insert(targets, t)
+                end
+            end
+        end
+    end
+    
+    local entitiesFolder = workspace:FindFirstChild("Entities")
+    if entitiesFolder then
+        for _, e in ipairs(entitiesFolder:GetChildren()) do
+            if valid(e) then
+                local d = (e.HumanoidRootPart.Position - pos).Magnitude
+                if d <= 100 then
+                    table.insert(targets, e)
+                end
+            end
+        end
+    end
+
+    return targets
+end
+
+local function blitz(targets)
+    if not Remote then return end
+    pcall(function()
+        for _, t in ipairs(targets) do
+            task.spawn(function()
+                for i = 1, 25 do
+                    Remote:InvokeServer(t, 1)
+                    Remote:InvokeServer(t, 2)
+                end
+            end)
+        end
+    end)
+end
+
+local function GetUnanchoredParts()
+    local Parts = {}
+    for _, v in ipairs(workspace:GetDescendants()) do
+        if v:IsA("BasePart") and not v.Anchored then
+            table.insert(Parts, v)
+        end
+    end
+    return Parts
+end
+
+local function GetRandomPlayer()
+    local plrs = Players:GetPlayers()
+    local plrsExcl = {}
+    for _, v in ipairs(plrs) do
+        if v ~= LocalPlayer then
+            table.insert(plrsExcl, v)
+        end
+    end
+    if #plrsExcl == 0 then return nil end
+    return plrsExcl[math.random(1, #plrsExcl)]
+end
+
+local function autoCollectDrops()
+    pcall(function()
+        local myChar = LocalPlayer.Character
+        if not valid(myChar) then return end
+        local rootPart = myChar.HumanoidRootPart
+
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("BasePart") then
+                local nameLower = obj.Name:lower()
+                if nameLower:find("drop") or nameLower:find("coin") or nameLower:find("gem") or nameLower:find("chest") or nameLower:find("item") or nameLower:find("loot") then
+                    obj.CFrame = rootPart.CFrame
+                    obj.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                end
+            end
+        end
+    end)
+end
+
+-- UI Setup
+local sg = Instance.new("ScreenGui", game.CoreGui)
+sg.Name = "CombatHubUI"
+sg.ResetOnSpawn = false
+
+local espHolder = Instance.new("Folder", sg)
+espHolder.Name = "ESPFolder"
+
+local activeDrawings = {}
+
+local function createESPElement(character)
+    if activeDrawings[character] then return end
+    
+    local box = Instance.new("Frame", espHolder)
+    box.BackgroundTransparency = 1
+    box.BorderSizePixel = 0
+    box.Visible = false
+    
+    local outline = Instance.new("UIStroke", box)
+    outline.Color = Color3.fromRGB(255, 50, 50)
+    outline.Thickness = 1.5
+    
+    local healthBarBg = Instance.new("Frame", box)
+    healthBarBg.Name = "HPBg"
+    healthBarBg.Size = UDim2.new(0, 4, 1, 0)
+    healthBarBg.Position = UDim2.new(0, -6, 0, 0)
+    healthBarBg.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    healthBarBg.BorderSizePixel = 0
+    
+    local healthBar = Instance.new("Frame", healthBarBg)
+    healthBar.Name = "HP"
+    healthBar.Size = UDim2.new(1, 0, 1, 0)
+    healthBar.BackgroundColor3 = Color3.fromRGB(80, 255, 80)
+    healthBar.BorderSizePixel = 0
+    
+    activeDrawings[character] = {Box = box, HP = healthBar}
+end
+
+local function removeESPElement(character)
+    if activeDrawings[character] then
+        activeDrawings[character].Box:Destroy()
+        activeDrawings[character] = nil
+    end
+end
+
+-- Notification popup
+local notifFrame = Instance.new("Frame", sg)
+notifFrame.Size = UDim2.new(0, 260, 0, 50)
+notifFrame.Position = UDim2.new(0.5, -130, 0, -60)
+notifFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+notifFrame.BorderSizePixel = 0
+notifFrame.ZIndex = 10
+
+Instance.new("UICorner", notifFrame).CornerRadius = UDim.new(0, 8)
+
+local notifText = Instance.new("TextLabel", notifFrame)
+notifText.Size = UDim2.new(1, 0, 1, 0)
+notifText.BackgroundTransparency = 1
+notifText.Font = Enum.Font.GothamBold
+notifText.Text = "Made by animica"
+notifText.TextColor3 = Color3.fromRGB(255, 255, 255)
+notifText.TextSize = 14
+notifText.ZIndex = 11
+
+notifFrame:TweenPosition(UDim2.new(0.5, -130, 0, 30), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.4, true)
+task.spawn(function()
+    task.wait(3.5)
+    notifFrame:TweenPosition(UDim2.new(0.5, -130, 0, -80), Enum.EasingDirection.In, Enum.EasingStyle.Quad, 0.4, true)
+    task.wait(0.5)
+    notifFrame:Destroy()
+end)
+
+local mainFrame = Instance.new("Frame", sg)
+mainFrame.Size = UDim2.new(0, 480, 0, 380)
+mainFrame.Position = UDim2.new(0.5, -240, 0.5, -190)
+mainFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 28)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
+
+local topBar = Instance.new("Frame", mainFrame)
+topBar.Size = UDim2.new(1, 0, 0, 35)
+topBar.BackgroundColor3 = Color3.fromRGB(20, 20, 23)
+topBar.BorderSizePixel = 0
+
+Instance.new("UICorner", topBar).CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel", topBar)
+title.Size = UDim2.new(1, -60, 1, 0)
+title.Position = UDim2.new(0, 15, 0, 0)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.Text = "Combat Hub — Made by animica"
+title.TextColor3 = Color3.fromRGB(240, 240, 245)
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+
+local minimizeButton = Instance.new("TextButton", topBar)
+minimizeButton.Size = UDim2.new(0, 30, 0, 25)
+minimizeButton.Position = UDim2.new(1, -35, 0.5, -12.5)
+minimizeButton.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
+minimizeButton.BorderSizePixel = 0
+minimizeButton.Font = Enum.Font.GothamBold
+minimizeButton.Text = "-"
+minimizeButton.TextColor3 = Color3.fromRGB(220, 220, 225)
+minimizeButton.TextSize = 16
+
+Instance.new("UICorner", minimizeButton).CornerRadius = UDim.new(0, 6)
+
+local sidebar = Instance.new("Frame", mainFrame)
+sidebar.Size = UDim2.new(0, 130, 1, -35)
+sidebar.Position = UDim2.new(0, 0, 0, 35)
+sidebar.BackgroundColor3 = Color3.fromRGB(20, 20, 23)
+sidebar.BorderSizePixel = 0
+
+local tabButton = Instance.new("TextButton", sidebar)
+tabButton.Size = UDim2.new(1, -16, 0, 32)
+tabButton.Position = UDim2.new(0, 8, 0, 10)
+tabButton.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+tabButton.BorderSizePixel = 0
+tabButton.Font = Enum.Font.GothamSemibold
+tabButton.Text = "Combat / Movement"
+tabButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+tabButton.TextSize = 11
+
+Instance.new("UICorner", tabButton).CornerRadius = UDim.new(0, 6)
+
+local container = Instance.new("ScrollingFrame", mainFrame)
+container.Size = UDim2.new(1, -145, 1, -45)
+container.Position = UDim2.new(0, 140, 0, 40)
+container.BackgroundTransparency = 1
+container.BorderSizePixel = 0
+container.CanvasSize = UDim2.new(0, 0, 0, 430)
+container.ScrollBarThickness = 4
+
+local minimized = false
+minimizeButton.Activated:Connect(function()
+    minimized = not minimized
+    sidebar.Visible = not minimized
+    container.Visible = not minimized
+    if minimized then
+        mainFrame:TweenSize(UDim2.new(0, 480, 0, 35), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.2, true)
+        minimizeButton.Text = "+"
+    else
+        mainFrame:TweenSize(UDim2.new(0, 480, 0, 380), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.2, true)
+        minimizeButton.Text = "-"
+    end
+end)
+
+local function createToggle(name, yPos, callback)
+    local toggleContainer = Instance.new("Frame", container)
+    toggleContainer.Size = UDim2.new(1, -10, 0, 46)
+    toggleContainer.Position = UDim2.new(0, 5, 0, yPos)
+    toggleContainer.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+    toggleContainer.BorderSizePixel = 0
+
+    Instance.new("UICorner", toggleContainer).CornerRadius = UDim.new(0, 6)
+
+    local toggleTitle = Instance.new("TextLabel", toggleContainer)
+    toggleTitle.Size = UDim2.new(1, -60, 1, 0)
+    toggleTitle.Position = UDim2.new(0, 12, 0, 0)
+    toggleTitle.BackgroundTransparency = 1
+    toggleTitle.Font = Enum.Font.GothamSemibold
+    toggleTitle.Text = name
+    toggleTitle.TextColor3 = Color3.fromRGB(220, 220, 225)
+    toggleTitle.TextSize = 13
+    toggleTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+    local toggleSwitch = Instance.new("TextButton", toggleContainer)
+    toggleSwitch.Size = UDim2.new(0, 40, 0, 20)
+    toggleSwitch.Position = UDim2.new(1, -50, 0.5, -10)
+    toggleSwitch.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    toggleSwitch.BorderSizePixel = 0
+    toggleSwitch.Text = ""
+
+    Instance.new("UICorner", toggleSwitch).CornerRadius = UDim.new(0, 10)
+
+    local toggleCircle = Instance.new("Frame", toggleSwitch)
+    toggleCircle.Size = UDim2.new(0, 16, 0, 16)
+    toggleCircle.Position = UDim2.new(0, 2, 0.5, -8)
+    toggleCircle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    toggleCircle.BorderSizePixel = 0
+
+    Instance.new("UICorner", toggleCircle).CornerRadius = UDim.new(1, 0)
+
+    local function updateUI(state)
+        if state then
+            toggleSwitch.BackgroundColor3 = Color3.fromRGB(80, 200, 120)
+            toggleCircle:TweenPosition(UDim2.new(1, -18, 0.5, -8), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.15, true)
+        else
+            toggleSwitch.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+            toggleCircle:TweenPosition(UDim2.new(0, 2, 0.5, -8), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.15, true)
+        end
+    end
+
+    local function trigger()
+        local newState = callback()
+        updateUI(newState)
+    end
+
+    toggleContainer.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            trigger()
+        end
+    end)
+
+    toggleSwitch.Activated:Connect(trigger)
+end
+
+-- Function to add slider controls for Speed
+local function createSlider(name, yPos, min, max, default, callback)
+    local sliderContainer = Instance.new("Frame", container)
+    sliderContainer.Size = UDim2.new(1, -10, 0, 55)
+    sliderContainer.Position = UDim2.new(0, 5, 0, yPos)
+    sliderContainer.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+    sliderContainer.BorderSizePixel = 0
+
+    Instance.new("UICorner", sliderContainer).CornerRadius = UDim.new(0, 6)
+
+    local sliderTitle = Instance.new("TextLabel", sliderContainer)
+    sliderTitle.Size = UDim2.new(1, -20, 0, 20)
+    sliderTitle.Position = UDim2.new(0, 12, 0, 5)
+    sliderTitle.BackgroundTransparency = 1
+    sliderTitle.Font = Enum.Font.GothamSemibold
+    sliderTitle.Text = name .. ": " .. default
+    sliderTitle.TextColor3 = Color3.fromRGB(220, 220, 225)
+    sliderTitle.TextSize = 13
+    sliderTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+    local bgBar = Instance.new("Frame", sliderContainer)
+    bgBar.Size = UDim2.new(1, -24, 0, 6)
+    bgBar.Position = UDim2.new(0, 12, 0, 35)
+    bgBar.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    bgBar.BorderSizePixel = 0
+
+    Instance.new("UICorner", bgBar).CornerRadius = UDim.new(1, 0)
+
+    local fillBar = Instance.new("Frame", bgBar)
+    fillBar.Size = UDim2.new((default - min) / (max - min), 0, 1, 0)
+    fillBar.BackgroundColor3 = Color3.fromRGB(80, 200, 120)
+    fillBar.BorderSizePixel = 0
+
+    Instance.new("UICorner", fillBar).CornerRadius = UDim.new(1, 0)
+
+    local dragging = false
+    bgBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local pos = math.clamp((input.Position.X - bgBar.AbsolutePosition.X) / bgBar.AbsoluteSize.X, 0, 1)
+            local val = math.floor(min + ((max - min) * pos))
+            fillBar.Size = UDim2.new(pos, 0, 1, 0)
+            sliderTitle.Text = name .. ": " .. val
+            callback(val)
+        end
+    end)
+end
+
+-- UI Components Creation
+createToggle("God+ Killaura", 5, function()
+    enabled = not enabled
+    return enabled
+end)
+
+createToggle("AutoKill", 60, function()
+    autoKillEnabled = not autoKillEnabled
+    return autoKillEnabled
+end)
+
+createToggle("ESP & Health Bars", 115, function()
+    espEnabled = not espEnabled
+    if not espEnabled then
+        for char, _ in pairs(activeDrawings) do
+            removeESPElement(char)
+        end
+    end
+    return espEnabled
+end)
+
+createToggle("Auto Collect Drops", 170, function()
+    autoCollectEnabled = not autoCollectEnabled
+    return autoCollectEnabled
+end)
+
+createToggle("Infinite Jump", 225, function()
+    infJumpEnabled = not infJumpEnabled
+    return infJumpEnabled
+end)
+
+createToggle("Fly (IE Style)", 280, function()
+    flyEnabled = not flyEnabled
+    flying = flyEnabled
+    if flying then
+        task.spawn(function()
+            local char = LocalPlayer.Character
+            if not valid(char) then return end
+            local hrp = char.HumanoidRootPart
+            
+            bodyVelocity = Instance.new("BodyVelocity")
+            bodyVelocity.Velocity = Vector3.new(0, 0, 0)
+            bodyVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+            bodyVelocity.Parent = hrp
+
+            bodyGyro = Instance.new("BodyGyro")
+            bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+            bodyGyro.CFrame = hrp.CFrame
+            bodyGyro.Parent = hrp
+
+            while flying and valid(LocalPlayer.Character) do
+                local camCFrame = Camera.CFrame
+                local moveDir = Vector3.new()
+                if controlKeys.W == 1 then moveDir = moveDir + camCFrame.LookVector end
+                if controlKeys.S == 1 then moveDir = moveDir - camCFrame.LookVector end
+                if controlKeys.A == 1 then moveDir = moveDir - camCFrame.RightVector end
+                if controlKeys.D == 1 then moveDir = moveDir + camCFrame.RightVector end
+                if controlKeys.Q == 1 then moveDir = moveDir - Vector3.new(0, 1, 0) end
+                if controlKeys.E == 1 then moveDir = moveDir + Vector3.new(0, 1, 0) end
+                
+                bodyVelocity.Velocity = moveDir * flySpeed
+                bodyGyro.CFrame = camCFrame
+                RunService.RenderStepped:Wait()
+            end
+            
+            if bodyVelocity then bodyVelocity:Destroy() end
+            if bodyGyro then bodyGyro:Destroy() end
+        end)
+    end
+    return flyEnabled
+end)
+
+createSlider("Fly Speed", 335, 10, 200, 50, function(v)
+    flySpeed = v
+end)
+
+createToggle("Speed Hack", 390, function()
+    speedEnabled = not speedEnabled
+    return speedEnabled
+end)
+
+-- Fly key inputs tracking
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if not gameProcessed then
+        if input.KeyCode == Enum.KeyCode.W then controlKeys.W = 1 end
+        if input.KeyCode == Enum.KeyCode.S then controlKeys.S = 1 end
+        if input.KeyCode == Enum.KeyCode.A then controlKeys.A = 1 end
+        if input.KeyCode == Enum.KeyCode.D then controlKeys.D = 1 end
+        if input.KeyCode == Enum.KeyCode.Space and infJumpEnabled then
+            local char = LocalPlayer.Character
+            if valid(char) then
+                char.Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+            end
+        end
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.W then controlKeys.W = 0 end
+    if input.KeyCode == Enum.KeyCode.S then controlKeys.S = 0 end
+    if input.KeyCode == Enum.KeyCode.A then controlKeys.A = 0 end
+    if input.KeyCode == Enum.KeyCode.D then controlKeys.D = 0 end
+end)
+
+-- Unified Heartbeat Loop
+RunService.Heartbeat:Connect(function()
+    if enabled then
+        local targets = getAllTargets()
+        if #targets > 0 then
+            blitz(targets)
+        end
+    end
+    
+    if autoKillEnabled then
+        local unanchoredParts = GetUnanchoredParts()
+        for _, part in ipairs(unanchoredParts) do
+            part.AssemblyLinearVelocity = Vector3.new(0, -5, 0)
+        end
+        for _, part in ipairs(unanchoredParts) do
+            local success, owner = pcall(function() return isnetworkowner(part) end)
+            if success and owner then
+                local targetPlayer = GetRandomPlayer()
+                if targetPlayer and targetPlayer.Character and targetPlayer.Character.PrimaryPart then
+                    part.CFrame = targetPlayer.Character.PrimaryPart.CFrame
+                end
+            end
+        end
+    end
+
+    if autoCollectEnabled then
+        autoCollectDrops()
+    end
+
+    if speedEnabled then
+        local char = LocalPlayer.Character
+        if valid(char) then
+            char.Humanoid.WalkSpeed = 35 -- Custom modified speed
+        end
+    end
+
+    if espEnabled then
+        local currentTargets = getAllTargets()
+        local tracked = {}
+
+        for _, target in ipairs(currentTargets) do
+            tracked[target] = true
+            createESPElement(target)
+            
+            local drawing = activeDrawings[target]
+            local rootPart = target:FindFirstChild("HumanoidRootPart")
+            local humanoid = target:FindFirstChild("Humanoid")
+            
+            if rootPart and humanoid and drawing then
+                local vector, onScreen = Camera:WorldToViewportPoint(rootPart.Position)
+                if onScreen then
+                    local sizeFactor = math.clamp(1000 / (Camera.CFrame.Position - rootPart.Position).Magnitude, 20, 400)
+                    drawing.Box.Size = UDim2.new(0, sizeFactor * 0.6, 0, sizeFactor)
+                    drawing.Box.Position = UDim2.new(0, vector.X - (sizeFactor * 0.3), 0, vector.Y - (sizeFactor * 0.5))
+                    
+                    local healthPercent = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
+                    drawing.HP.Size = UDim2.new(1, 0, healthPercent, 0)
+                    drawing.HP.Position = UDim2.new(0, 0, 1 - healthPercent, 0)
+                    drawing.HP.BackgroundColor3 = Color3.fromRGB(255 * (1 - healthPercent), 255 * healthPercent, 0)
+                    
+                    drawing.Box.Visible = true
+                else
+                    drawing.Box.Visible = false
+                end
+            end
+        end
+
+        for char, _ in pairs(activeDrawings) do
+            if not tracked[char] then
+                removeESPElement(char)
+            end
+        end
+    end
+end)
