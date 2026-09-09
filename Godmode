@@ -1,1 +1,42 @@
+-- Roblox UI Library Script (Using Orion Lib as an example framework)
+local OrionLib = loadstring(game:HttpGet(('https://raw.githubusercontent.com/shlexware/Orion/main/source')))()
 
+-- Create the main window
+local Window = OrionLib:MakeWindow({
+    Name = "Status Update",
+    HidePremium = false,
+    SaveConfig = true,
+    ConfigFolder = "DownConfig"
+})
+
+-- Create the Tab
+local Tab = Window:MakeTab({
+    Name = "Notice",
+    Icon = "rbxassetid://4483345998",
+    PremiumOnly = false
+})
+
+-- Add the label message under the tab
+Tab:AddParagraph("System Notice", "Hi , Script is Down For 2 days just dont be sad guys")
+
+-- Add the button linking to the WhatsApp group
+Tab:AddButton({
+    Name = "Join Whatsapp Group",
+    Callback = function()
+        -- Copies the link to clipboard or attempts to prompt
+        if setclipboard then
+            setclipboard("https://chat.whatsapp.com/E0OHhDvEqaP3zXvIP4W6OA?mode=gi_t")
+            OrionLib:MakeNotification({
+                Name = "Success!",
+                Content = "WhatsApp link copied to your clipboard!",
+                Image = "rbxassetid://4483345998",
+                Time = 5
+            })
+        else
+            print("WhatsApp Group: https://chat.whatsapp.com/E0OHhDvEqaP3zXvIP4W6OA?mode=gi_t")
+        end
+    end
+})
+
+-- Initialize the UI
+OrionLib:Init()
